@@ -1,0 +1,11 @@
+START
+    Set name = "Shayan Sikandar"
+    Set age = 21
+    Set year = 2026
+
+    Calculate birthYear = year - age
+
+    Print "Name: " + name
+    Print "Age: " + age
+    Print "Born in: " + birthYear
+END
