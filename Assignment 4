@@ -1,0 +1,93 @@
+
+import platform
+import subprocess
+import socket
+import json
+from datetime import datetime
+
+
+# 1. Collect Operating System Information
+def get_os_info():
+    os_info = {
+        "Operating System": platform.system(),
+        "OS Version": platform.version(),
+        "OS Release": platform.release(),
+        "Computer Name": platform.node(),
+        "Architecture": platform.machine(),
+        "Processor": platform.processor()
+    }
+
+    return os_info
+
+
+# 2. Collect Installed Windows Hotfixes
+def get_hotfixes():
+    try:
+        result = subprocess.run(
+            ["powershell", "-Command",
+             "Get-HotFix | Select-Object HotFixID, Description, InstalledOn | ConvertTo-Json"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+
+        return {"Error": result.stderr.strip() or "No hotfix records found"}
+
+    except Exception as e:
+        return {"Error": str(e)}
+
+
+# 3. Collect Local Listening TCP Ports
+def get_listening_ports():
+    ports = []
+
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        for line in result.stdout.splitlines():
+            parts = line.split()
+
+            if len(parts) >= 5 and parts[0].upper() == "TCP":
+                if parts[3].upper() == "LISTENING":
+                    ports.append({
+                        "Local Address": parts[1],
+                        "Local Port": parts[1].split(":")[-1],
+                        "PID": parts[4]
+                    })
+
+    except Exception as e:
+        return {"Error": str(e)}
+
+    return ports
+
+
+# 4. Main Program
+def main():
+    print("=" * 50)
+    print("SYSTEM INFORMATION COLLECTION")
+    print("=" * 50)
+
+    print("\nCollection Time:", datetime.now())
+
+    print("\n--- OPERATING SYSTEM INFORMATION ---")
+    print(json.dumps(get_os_info(), indent=4))
+
+    print("\n--- INSTALLED HOTFIXES ---")
+    print(json.dumps(get_hotfixes(), indent=4, default=str))
+
+    print("\n--- LISTENING TCP PORTS ---")
+    print(json.dumps(get_listening_ports(), indent=4))
+
+    print("\nCollection Complete.")
+
+
+if __name__ == "__main__":
+    main()
