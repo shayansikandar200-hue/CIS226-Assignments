@@ -1,0 +1,406 @@
+
+# Vulnerability Scan Results Analyzer
+# Python 3.11 / Pandas / Spyder
+
+import json
+from pathlib import Path
+import pandas as pd
+
+# Input configuration
+SCAN_FILE = ""  # Example: "vulnerabilities.csv"
+OUTPUT = Path("remediation_results")
+
+OS_FILE = "os_inventory.csv"
+PORT_FILE = "listening_ports.csv"
+HOTFIX_FILE = "installed_hotfixes.csv"
+
+# This is a review-priority model, not a CVSS score.
+ASSET_POINTS = {
+    "Critical": 40,
+    "High": 30,
+    "Medium": 20,
+    "Low": 10
+}
+
+# Services that deserve closer configuration review
+SERVICE_POINTS = {
+    "Telnet": 35,
+    "FTP": 30,
+    "RDP": 25,
+    "SMB": 20,
+    "VNC": 25,
+    "HTTP": 15,
+    "HTTP-ALT": 15
+}
+
+
+# Function 1: Load CSV or JSON
+def load_report(filename):
+
+    path = Path(filename)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"File not found: {filename}"
+        )
+
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
+
+    if path.suffix.lower() == ".json":
+        with open(path, encoding="utf-8") as file:
+            data = json.load(file)
+
+        if isinstance(data, dict):
+            data = data.get("findings", data.get("results"))
+
+        if not isinstance(data, list):
+            raise ValueError(
+                "JSON must contain a list of findings."
+            )
+
+        return pd.json_normalize(data)
+
+    raise ValueError("Only CSV and JSON are supported.")
+
+
+# Function 2: Validate a findings report
+def validate_findings(df):
+
+    required = ["Host", "Finding", "Severity"]
+
+    missing = [
+        col for col in required
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Missing columns: " + ", ".join(missing)
+        )
+
+    if df.empty:
+        raise ValueError("The report is empty.")
+
+    df = df.copy()
+
+    for col in required:
+        if df[col].isna().any():
+            raise ValueError(
+                f"Missing values in {col}"
+            )
+
+    valid_levels = [
+        "Critical", "High", "Medium", "Low", "Info"
+    ]
+
+    df["Severity"] = (
+        df["Severity"].astype(str).str.strip().str.title()
+    )
+
+    if not df["Severity"].isin(valid_levels).all():
+        raise ValueError("Invalid severity detected.")
+
+    return df
+
+
+# Function 3: Prioritize confirmed scan findings
+def analyze_findings(df):
+
+    df = validate_findings(df)
+
+    severity_points = {
+        "Critical": 90,
+        "High": 70,
+        "Medium": 50,
+        "Low": 25,
+        "Info": 10
+    }
+
+    df["Priority_Score"] = (
+        df["Severity"].map(severity_points)
+    )
+
+    # CVSS is optional, and must be supplied by scanner.
+    if "CVSS" in df.columns:
+        df["CVSS"] = pd.to_numeric(
+            df["CVSS"], errors="coerce"
+        )
+
+        if df["CVSS"].dropna().between(0, 10).eq(
+            False
+        ).any():
+            raise ValueError("CVSS must be between 0 and 10.")
+
+        df["Priority_Score"] += (
+            df["CVSS"].fillna(0) * 1
+        )
+
+    df["Evidence_Type"] = "Scanner finding"
+
+    df["Recommended_Action"] = (
+        "Review scanner evidence, verify affected "
+        "software and apply vendor-approved remediation."
+    )
+
+    return df.sort_values(
+        "Priority_Score",
+        ascending=False
+    ).reset_index(drop=True)
+
+
+# Function 4: Analyze the uploaded inventory
+def analyze_inventory():
+
+    os_data = load_report(OS_FILE)
+    ports = load_report(PORT_FILE)
+    hotfixes = load_report(HOTFIX_FILE)
+
+    # Check required columns
+    requirements = [
+        (os_data, [
+            "Host", "Asset_Criticality",
+            "OS_Name", "Owner", "Last_Seen"
+        ]),
+        (ports, [
+            "Host", "LocalPort", "Protocol",
+            "Service", "Exposure", "State"
+        ]),
+        (hotfixes, [
+            "Host", "HotFixID",
+            "InstalledOn", "Update_Status"
+        ])
+    ]
+
+    for table, columns in requirements:
+        missing = [
+            col for col in columns
+            if col not in table.columns
+        ]
+
+        if missing:
+            raise ValueError(
+                "Missing columns: " + ", ".join(missing)
+            )
+
+    # Join ports with host ownership and criticality
+    inventory = ports.merge(
+        os_data[[
+            "Host", "OS_Name",
+            "Asset_Criticality", "Owner"
+        ]],
+        on="Host",
+        how="left",
+        validate="many_to_one"
+    )
+
+    if inventory["Asset_Criticality"].isna().any():
+        raise ValueError(
+            "Some port records have no matching host."
+        )
+
+    # Only listening TCP entries
+    inventory = inventory[
+        (
+            inventory["Protocol"].astype(str)
+            .str.upper() == "TCP"
+        )
+        &
+        (
+            inventory["State"].astype(str)
+            .str.lower() == "listen"
+        )
+    ].copy()
+
+    inventory["Service"] = (
+        inventory["Service"].astype(str).str.strip()
+    )
+
+    # Assign review priority based on configuration
+    inventory["Priority_Score"] = (
+        inventory["Asset_Criticality"]
+        .map(ASSET_POINTS).fillna(10)
+        +
+        inventory["Service"]
+        .map(SERVICE_POINTS).fillna(5)
+        +
+        inventory["Exposure"].astype(str)
+        .str.lower().eq("network").astype(int) * 20
+    )
+
+    inventory["Priority_Score"] = (
+        inventory["Priority_Score"].clip(upper=100)
+    )
+
+    inventory["Review_Priority"] = pd.cut(
+        inventory["Priority_Score"],
+        bins=[-1, 39, 59, 79, 100],
+        labels=["Low", "Medium", "High", "Critical"]
+    )
+
+    inventory["Finding"] = (
+        "Review listening TCP service: "
+        + inventory["Service"]
+    )
+
+    inventory["Evidence_Type"] = (
+        "Inventory observation - not confirmed vulnerability"
+    )
+
+    inventory["Recommended_Action"] = (
+        "Confirm business need, access restrictions, "
+        "service configuration and vendor security updates."
+    )
+
+    # Identify newest recorded hotfix per host
+    hotfixes = hotfixes.copy()
+
+    hotfixes["InstalledOn"] = pd.to_datetime(
+        hotfixes["InstalledOn"], errors="coerce"
+    )
+
+    installed = hotfixes[
+        hotfixes["Update_Status"].astype(str)
+        .str.lower() == "installed"
+    ]
+
+    latest = (
+        installed.groupby("Host")["InstalledOn"]
+        .max()
+        .reset_index()
+        .rename(columns={
+            "InstalledOn": "Latest_Recorded_Hotfix"
+        })
+    )
+
+    inventory = inventory.merge(
+        latest, on="Host", how="left",
+        validate="many_to_one"
+    )
+
+    inventory["Patch_Review_Note"] = (
+        "Check authoritative Windows Update records "
+        "and applicable vendor advisories; this inventory "
+        "does not prove that patches are missing."
+    )
+
+    return inventory.sort_values(
+        "Priority_Score",
+        ascending=False
+    ).reset_index(drop=True)
+
+
+# Function 5: Export safely for Excel
+def export_csv(df, filename):
+
+    safe = df.copy()
+
+    for column in safe.select_dtypes(
+        include=["object", "str"]
+    ).columns:
+
+        safe[column] = safe[column].map(
+            lambda value: (
+                "'" + value
+                if isinstance(value, str)
+                and value.lstrip().startswith(
+                    ("=", "+", "-", "@")
+                )
+                else value
+            )
+        )
+
+    safe.to_csv(
+        OUTPUT / filename,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+
+# Function 6: Main program
+def main():
+
+    OUTPUT.mkdir(exist_ok=True)
+
+    print("===== VULNERABILITY RESULTS ANALYZER =====")
+
+    if SCAN_FILE:
+        results = analyze_findings(
+            load_report(SCAN_FILE)
+        )
+
+        mode = "Scanner findings"
+
+    else:
+        results = analyze_inventory()
+
+        mode = "Inventory review candidates"
+
+    print("\nAnalysis Mode:", mode)
+    print("Total review items:", len(results))
+
+    print("\n===== PRIORITIZED REMEDIATION LIST =====")
+
+    display_columns = [
+        "Host", "Finding",
+        "Priority_Score", "Recommended_Action"
+    ]
+
+    print(
+        results[display_columns]
+        .head(15).to_string(index=False)
+    )
+
+    # Detailed review list
+    export_csv(
+        results,
+        "prioritized_remediation.csv"
+    )
+
+    # Management summary
+    summary = pd.DataFrame([
+        {
+            "Metric": "Analysis Mode",
+            "Value": mode
+        },
+        {
+            "Metric": "Total Review Items",
+            "Value": len(results)
+        },
+        {
+            "Metric": "Affected Hosts",
+            "Value": results["Host"].nunique()
+        },
+        {
+            "Metric": "Highest Priority Score",
+            "Value": results["Priority_Score"].max()
+        },
+        {
+            "Metric": "Confirmed Vulnerabilities",
+            "Value": (
+                "Not established by inventory"
+                if not SCAN_FILE
+                else "See scanner findings"
+            )
+        }
+    ])
+
+    export_csv(
+        summary,
+        "management_summary.csv"
+    )
+
+    print("\nReports saved in:", OUTPUT)
+    print("Analysis completed.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (
+        FileNotFoundError,
+        ValueError,
+        KeyError,
+        OSError
+    ) as error:
+        print("Analysis error:", error)
