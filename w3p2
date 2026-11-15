@@ -1,0 +1,823 @@
+# Project 1: Failed Logon Detection and Account Triage
+
+# Python 3.11 / Pandas / Spyder
+
+import csv
+
+from pathlib import Path
+
+from datetime import datetime, timezone
+
+import pandas as pd
+
+# Configuration
+
+FILE_NAME = "windows_authentication_1000_events.csv"
+
+THRESHOLD = 5
+
+WINDOW_MINUTES = 10
+
+EVENTS = {
+
+  4624: "Successful logon",
+
+  4625: "Failed logon",
+
+  4634: "Logoff"
+
+}
+
+ALIASES = {
+
+  "timestamp": [
+
+    "timestamp", "timecreated", "time_created",
+
+    "datetime", "date_time", "eventtime"
+
+  ],
+
+  "event_id": ["eventid", "event_id", "id"],
+
+  "account": [
+
+    "account", "username", "user",
+
+    "targetusername", "target_user_name"
+
+  ],
+
+  "source_ip": [
+
+    "sourceip", "source_ip", "ipaddress",
+
+    "ip_address", "clientip"
+
+  ],
+
+  "computer": [
+
+    "computer", "computername", "host", "hostname"
+
+  ],
+
+  "record_id": [
+
+    "recordid", "record_id", "eventrecordid"
+
+  ]
+
+}
+
+def normalize(text):
+
+  return "".join(
+
+    char.lower() for char in str(text)
+
+    if char.isalnum()
+
+  )
+
+# Step 1: Validate the CSV file
+
+def load_and_validate(path):
+
+  raw = pd.read_csv(
+
+    path,
+
+    dtype=str,
+
+    keep_default_na=False,
+
+    encoding="utf-8-sig"
+
+  )
+
+  if raw.empty:
+
+    raise ValueError("The CSV file is empty.")
+
+  column_map = {}
+
+  for canonical, choices in ALIASES.items():
+
+    match = next(
+
+      (
+
+        col for col in raw.columns
+
+        if normalize(col) in {
+
+          normalize(x) for x in choices
+
+        }
+
+      ),
+
+      None
+
+    )
+
+    if match is not None:
+
+      column_map[canonical] = match
+
+  required = ["timestamp", "event_id", "account"]
+
+  missing = [
+
+    col for col in required
+
+    if col not in column_map
+
+  ]
+
+  if missing:
+
+    raise ValueError(
+
+      "Missing required columns: " + ", ".join(missing)
+
+    )
+
+  df = pd.DataFrame({
+
+    key: raw[value].astype(str).str.strip()
+
+    for key, value in column_map.items()
+
+  })
+
+  for col in ALIASES:
+
+    if col not in df.columns:
+
+      df[col] = ""
+
+  # CSV line numbers include the header
+
+  df["source_row"] = raw.index + 2
+
+  df["parsed_timestamp"] = pd.to_datetime(
+
+    df["timestamp"],
+
+    errors="coerce",
+
+    utc=True
+
+  )
+
+  df["parsed_event_id"] = pd.to_numeric(
+
+    df["event_id"],
+
+    errors="coerce"
+
+  )
+
+  valid = (
+
+    df["parsed_timestamp"].notna()
+
+    & df["parsed_event_id"].isin(EVENTS)
+
+    & df["account"].ne("")
+
+  )
+
+  issues = pd.DataFrame({
+
+    "source_row": df["source_row"],
+
+    "issue": [
+
+      "; ".join(
+
+        message for message in messages if message
+
+      )
+
+      for messages in zip(
+
+        df["parsed_timestamp"].isna().map(
+
+          lambda x: "Invalid timestamp" if x else ""
+
+        ),
+
+        (~df["parsed_event_id"].isin(EVENTS)).map(
+
+          lambda x: "Unselected Event ID" if x else ""
+
+        ),
+
+        df["account"].eq("").map(
+
+          lambda x: "Missing account" if x else ""
+
+        )
+
+      )
+
+    ]
+
+  })
+
+  issues = issues.loc[~valid].copy()
+
+  df = df.loc[valid].copy()
+
+  df["event_id"] = df["parsed_event_id"].astype(int)
+
+  df["event_type"] = df["event_id"].map(EVENTS)
+
+  df["source_ip"] = df["source_ip"].replace(
+
+    "", "(not recorded)"
+
+  )
+
+  df["timestamp_utc"] = (
+
+    df["parsed_timestamp"]
+
+    .dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+  )
+
+  return raw, df, issues
+
+# Step 2: Find repeated failures in a time window
+
+def peak_window(times, window_minutes):
+
+  times = sorted(times)
+
+  left = 0
+
+  best = 0
+
+  peak_end = None
+
+  span = pd.Timedelta(minutes=window_minutes)
+
+  for right, timestamp in enumerate(times):
+
+    while timestamp - times[left] > span:
+
+      left += 1
+
+    count = right - left + 1
+
+    if count > best:
+
+      best = count
+
+      peak_end = timestamp
+
+  return best, peak_end
+
+# Step 3: Build review queue
+
+def build_queue(df, threshold, window):
+
+  failed = df[df["event_id"] == 4625]
+
+  records = []
+
+  groups = failed.groupby(
+
+    ["account", "source_ip"],
+
+    sort=True
+
+  )
+
+  for (account, ip), group in groups:
+
+    peak, peak_end = peak_window(
+
+      group["parsed_timestamp"].tolist(),
+
+      window
+
+    )
+
+    if peak >= threshold:
+
+      records.append({
+
+        "account": account,
+
+        "source_ip": ip,
+
+        "failed_event_count": len(group),
+
+        "max_failures_in_window": peak,
+
+        "window_minutes": window,
+
+        "first_failure_utc": (
+
+          group["parsed_timestamp"].min().strftime(
+
+            "%Y-%m-%dT%H:%M:%SZ"
+
+          )
+
+        ),
+
+        "last_failure_utc": (
+
+          group["parsed_timestamp"].max().strftime(
+
+            "%Y-%m-%dT%H:%M:%SZ"
+
+          )
+
+        ),
+
+        "peak_window_end_utc": (
+
+          peak_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        ),
+
+        "source_rows": ",".join(
+
+          map(str, group["source_row"].tolist())
+
+        ),
+
+        "analyst_interpretation": (
+
+          "Repeated failed logons observed; "
+
+          "review context and authorized activity."
+
+        ),
+
+        "recommended_action": (
+
+          "Check account lockout policy, "
+
+          "system ownership, user report, "
+
+          "and related events."
+
+        ),
+
+        "disposition": (
+
+          "Needs analyst review "
+
+          "(not a determination of malicious activity)"
+
+        )
+
+      })
+
+  columns = [
+
+    "account", "source_ip",
+
+    "failed_event_count",
+
+    "max_failures_in_window",
+
+    "window_minutes",
+
+    "first_failure_utc",
+
+    "last_failure_utc",
+
+    "peak_window_end_utc",
+
+    "source_rows",
+
+    "analyst_interpretation",
+
+    "recommended_action",
+
+    "disposition"
+
+  ]
+
+  queue = pd.DataFrame(records, columns=columns)
+
+  return queue.sort_values(
+
+    ["max_failures_in_window", "failed_event_count"],
+
+    ascending=False
+
+  ).reset_index(drop=True)
+
+# Step 4: Independently verify results
+
+def independently_verify(path, df):
+
+  with open(
+
+    path, newline="", encoding="utf-8-sig"
+
+  ) as file:
+
+    original = list(csv.DictReader(file))
+
+  def get(source, canonical):
+
+    options = {
+
+      normalize(x) for x in ALIASES[canonical]
+
+    }
+
+    return next(
+
+      (
+
+        str(value).strip()
+
+        for key, value in source.items()
+
+        if normalize(key) in options
+
+      ),
+
+      ""
+
+    )
+
+  def valid_time(value):
+
+    try:
+
+      dt = datetime.fromisoformat(
+
+        value.strip().replace("Z", "+00:00")
+
+      )
+
+      if dt.tzinfo is None:
+
+        dt = dt.replace(tzinfo=timezone.utc)
+
+      return dt.astimezone(timezone.utc).strftime(
+
+        "%Y-%m-%dT%H:%M:%SZ"
+
+      )
+
+    except (ValueError, TypeError, AttributeError):
+
+      return None
+
+  tests = []
+
+  # Check five original source rows
+
+  for _, row in df.head(5).iterrows():
+
+    source = original[int(row["source_row"]) - 2]
+
+    expected = (
+
+      get(source, "account"),
+
+      get(source, "event_id"),
+
+      valid_time(get(source, "timestamp")),
+
+      get(source, "source_ip"),
+
+      get(source, "computer")
+
+    )
+
+    actual = (
+
+      row["account"],
+
+      str(row["event_id"]),
+
+      row["timestamp_utc"],
+
+      (
+
+        row["source_ip"]
+
+        if row["source_ip"] != "(not recorded)"
+
+        else ""
+
+      ),
+
+      row["computer"]
+
+    )
+
+    tests.append({
+
+      "check": f"Source row {row['source_row']}",
+
+      "pandas_value": " | ".join(map(str, actual)),
+
+      "independent_value": " | ".join(
+
+        map(str, expected)
+
+      ),
+
+      "result": (
+
+        "PASS" if expected == actual else "FAIL"
+
+      )
+
+    })
+
+  # Independently count two Event IDs
+
+  counts = {4624: 0, 4625: 0}
+
+  for source in original:
+
+    try:
+
+      number = int(get(source, "event_id"))
+
+    except (ValueError, TypeError):
+
+      continue
+
+    if (
+
+      valid_time(get(source, "timestamp"))
+
+      and get(source, "account")
+
+    ):
+
+      if number in counts:
+
+        counts[number] += 1
+
+  for number in (4625, 4624):
+
+    pandas_count = int(
+
+      (df["event_id"] == number).sum()
+
+    )
+
+    independent_count = counts[number]
+
+    tests.append({
+
+      "check": f"Aggregate Event {number}",
+
+      "pandas_value": pandas_count,
+
+      "independent_value": independent_count,
+
+      "result": (
+
+        "PASS"
+
+        if pandas_count == independent_count
+
+        else "FAIL"
+
+      )
+
+    })
+
+  return pd.DataFrame(tests)
+
+# Step 5: Safely export CSV
+
+def safe_csv(df, path):
+
+  safe = df.copy()
+
+  for column in safe.select_dtypes(
+
+    include=["object"]
+
+  ).columns:
+
+    safe[column] = safe[column].map(
+
+      lambda x: (
+
+        "'" + x
+
+        if isinstance(x, str)
+
+        and x.lstrip().startswith(
+
+          ("=", "+", "-", "@")
+
+        )
+
+        else x
+
+      )
+
+    )
+
+  safe.to_csv(
+
+    path,
+
+    index=False,
+
+    encoding="utf-8-sig"
+
+  )
+
+# Step 6: Run the analysis
+
+def analyze(path, threshold=5, window=10):
+
+  if threshold <= 0 or window <= 0:
+
+    raise ValueError(
+
+      "Threshold and window must be positive."
+
+    )
+
+  path = Path(path)
+
+  raw, df, issues = load_and_validate(path)
+
+  queue = build_queue(df, threshold, window)
+
+  verification = independently_verify(path, df)
+
+  summary = pd.DataFrame([
+
+    ("Input file", path.name),
+
+    ("Original source rows", len(raw)),
+
+    ("Validated relevant event rows", len(df)),
+
+    ("Excluded rows", len(issues)),
+
+    (
+
+      "4624 successful logons",
+
+      int((df["event_id"] == 4624).sum())
+
+    ),
+
+    (
+
+      "4625 failed logons",
+
+      int((df["event_id"] == 4625).sum())
+
+    ),
+
+    (
+
+      "4634 logoffs",
+
+      int((df["event_id"] == 4634).sum())
+
+    ),
+
+    ("Threshold failures", threshold),
+
+    ("Window minutes", window),
+
+    ("Account/IP combinations for review", len(queue)),
+
+    (
+
+      "Independent verification",
+
+      "PASS"
+
+      if (verification["result"] == "PASS").all()
+
+      else "FAIL"
+
+    ),
+
+    (
+
+      "Assessment caveat",
+
+      "Review queue only; no account or IP "
+
+      "classified as malicious."
+
+    )
+
+  ], columns=["metric", "value"])
+
+  output_dir = path.parent / "triage_output"
+
+  output_dir.mkdir(exist_ok=True)
+
+  exports = {
+
+    "management_summary.csv": summary,
+
+    "review_queue.csv": queue,
+
+    "filtered_evidence.csv": df[[
+
+      "source_row",
+
+      "timestamp_utc",
+
+      "event_id",
+
+      "event_type",
+
+      "account",
+
+      "source_ip",
+
+      "computer",
+
+      "record_id"
+
+    ]],
+
+    "validation_report.csv": issues,
+
+    "independent_verification.csv": verification
+
+  }
+
+  for filename, data in exports.items():
+
+    safe_csv(data, output_dir / filename)
+
+  print("\n===== MANAGEMENT SUMMARY =====")
+
+  print(summary.to_string(index=False))
+
+  print("\n===== REVIEW QUEUE =====")
+
+  print(queue[[
+
+    "account",
+
+    "source_ip",
+
+    "failed_event_count",
+
+    "max_failures_in_window"
+
+  ]].to_string(index=False))
+
+  print("\nReports saved to:", output_dir)
+
+  if not (verification["result"] == "PASS").all():
+
+    print("WARNING: Verification failed.")
+
+    print("Investigate before using the reports.")
+
+  return summary, queue, verification
+
+# Start the program
+
+if __name__ == "__main__":
+
+  analyze(
+
+    FILE_NAME,
+
+    threshold=THRESHOLD,
+
+    window=WINDOW_MINUTES
+
+  )
+
+3. Understand 
+
+oad_and_validate()
+
+peak_window()
+
+build_queue()
+
+independently_verify()
+
+safe_csv()
+
+analyze()
