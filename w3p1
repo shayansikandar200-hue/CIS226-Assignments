@@ -1,0 +1,271 @@
+
+# Windows Event Log Analyzer
+# Python 3.11 - Spyder
+# Install required library: pip install pywin32
+
+import csv
+from datetime import datetime
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+try:
+    import win32evtlog
+except ImportError:
+    win32evtlog = None
+
+# Available Windows Event Logs
+LOGS = {
+    "1": "Application",
+    "2": "System",
+    "3": "Security",
+    "4": "Setup",
+    "5": "Windows PowerShell"
+}
+
+# Event severity levels
+LEVELS = {
+    "0": "LogAlways",
+    "1": "Critical",
+    "2": "Error",
+    "3": "Warning",
+    "4": "Information",
+    "5": "Verbose"
+}
+
+COLUMNS = [
+    "Log",
+    "Timestamp",
+    "Event ID",
+    "Source",
+    "Severity",
+    "Computer"
+]
+
+XML_NS = {
+    "e": "http://schemas.microsoft.com/win/2004/08/events/event"
+}
+
+
+# Extract information from an event
+def parse_event(xml_text, log_name):
+
+    root = ET.fromstring(xml_text)
+    system = root.find("e:System", XML_NS)
+
+    if system is None:
+        raise ValueError("Event has no System section")
+
+    provider = system.find("e:Provider", XML_NS)
+    event_id = system.find("e:EventID", XML_NS)
+    timestamp = system.find("e:TimeCreated", XML_NS)
+    level = system.find("e:Level", XML_NS)
+    computer = system.find("e:Computer", XML_NS)
+
+    level_number = level.text if level is not None else None
+
+    return {
+        "Log": log_name,
+        "Timestamp": (
+            timestamp.get("SystemTime", "")
+            if timestamp is not None else ""
+        ),
+        "Event ID": (
+            (event_id.text or "")
+            if event_id is not None else ""
+        ),
+        "Source": (
+            provider.get("Name", "")
+            if provider is not None else ""
+        ),
+        "Severity": LEVELS.get(level_number, "Unknown"),
+        "Computer": (
+            (computer.text or "")
+            if computer is not None else ""
+        )
+    }
+
+
+# Read events from selected log
+def read_log(log_name, limit):
+
+    flags = (
+        win32evtlog.EvtQueryChannelPath
+        | win32evtlog.EvtQueryReverseDirection
+    )
+
+    records = []
+    query = None
+
+    try:
+        query = win32evtlog.EvtQuery(log_name, flags, "*")
+
+        while len(records) < limit:
+
+            batch = win32evtlog.EvtNext(
+                query, min(20, limit - len(records))
+            )
+
+            if not batch:
+                break
+
+            for event in batch:
+                try:
+                    xml_text = win32evtlog.EvtRender(
+                        event,
+                        win32evtlog.EvtRenderEventXml
+                    )
+
+                    records.append(
+                        parse_event(xml_text, log_name)
+                    )
+
+                except (ValueError, ET.ParseError, OSError) as error:
+                    print("Skipped unreadable event:", error)
+
+                finally:
+                    event.Close()
+
+    finally:
+        if query is not None:
+            query.Close()
+
+    return records
+
+
+# Protect CSV values from spreadsheet formulas
+def safe_excel_cell(value):
+
+    value = str(value)
+
+    if value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+
+    return value
+
+
+# Export results to CSV
+def export_csv(records, filename):
+
+    with open(
+        filename, "w", newline="", encoding="utf-8-sig"
+    ) as file:
+
+        writer = csv.DictWriter(
+            file, fieldnames=COLUMNS
+        )
+
+        writer.writeheader()
+
+        for record in records:
+            writer.writerow({
+                key: safe_excel_cell(record[key])
+                for key in COLUMNS
+            })
+
+
+# Ask user how many events to analyze
+def ask_limit():
+
+    answer = input(
+        "How many recent events per log? [100]: "
+    ).strip()
+
+    if not answer:
+        return 100
+
+    try:
+        value = int(answer)
+
+        if 1 <= value <= 10000:
+            return value
+
+    except ValueError:
+        pass
+
+    print("Invalid number. Using 100 events.")
+    return 100
+
+
+# Main program
+def main():
+
+    if win32evtlog is None:
+        print("Please install pywin32 first.")
+        print("Run: python -m pip install pywin32")
+        return
+
+    print("\n===== WINDOWS EVENT LOG ANALYZER =====")
+    print("1. Application")
+    print("2. System")
+    print("3. Security")
+    print("4. Setup")
+    print("5. Windows PowerShell")
+    print("6. All Five Logs")
+
+    choice = input("Select a log (1-6): ").strip()
+
+    if choice not in ("1", "2", "3", "4", "5", "6"):
+        print("Invalid selection.")
+        return
+
+    if choice == "6":
+        selected = list(LOGS.values())
+    else:
+        selected = [LOGS[choice]]
+
+    limit = ask_limit()
+    collected = []
+
+    for log_name in selected:
+
+        print("\nReading:", log_name)
+
+        try:
+            records = read_log(log_name, limit)
+
+        except Exception as error:
+            print("Unable to access:", log_name)
+            print("Error:", error)
+            print("Continuing with other logs.")
+            continue
+
+        print("Events found:", len(records))
+
+        # Display first 10 events
+        for record in records[:10]:
+
+            print("\n--------------------")
+
+            for field in COLUMNS:
+                print(field + ":", record[field])
+
+        collected.extend(records)
+
+    if not collected:
+        print("No events collected.")
+        return
+
+    # Create CSV file
+    filename = (
+        "event_logs_"
+        + datetime.now().strftime("%Y%m%d_%H%M%S")
+        + ".csv"
+    )
+
+    output = Path.cwd() / filename
+
+    try:
+        export_csv(collected, output)
+
+    except OSError as error:
+        print("CSV export failed:", error)
+        return
+
+    print("\nAnalysis Completed!")
+    print("Total events:", len(collected))
+    print("CSV saved at:", output)
+
+
+# Start program
+if __name__ == "__main__":
+    main()
