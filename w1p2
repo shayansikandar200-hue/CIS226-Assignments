@@ -1,0 +1,121 @@
+
+import hashlib
+import hmac
+
+# Create a hash for text or file data
+def calculate_hash(data, algorithm):
+    if algorithm == "md5":
+        return hashlib.md5(data).hexdigest()
+    elif algorithm == "shake_128":
+        return hashlib.shake_128(data).hexdigest(16)
+    elif algorithm == "sha256":
+        return hashlib.sha256(data).hexdigest()
+    else:
+        raise ValueError("Invalid algorithm")
+
+
+# Calculate the hash of a file
+def file_hash(filename, algorithm):
+    if algorithm == "md5":
+        hasher = hashlib.md5()
+    elif algorithm == "shake_128":
+        hasher = hashlib.shake_128()
+    elif algorithm == "sha256":
+        hasher = hashlib.sha256()
+    else:
+        raise ValueError("Invalid algorithm")
+
+    with open(filename, "rb") as file:
+        while True:
+            data = file.read(4096)
+            if not data:
+                break
+            hasher.update(data)
+
+    if algorithm == "shake_128":
+        return hasher.hexdigest(16)
+
+    return hasher.hexdigest()
+
+
+# Verify if a downloaded file matches
+def check_integrity(filename, expected_hash, algorithm):
+    actual_hash = file_hash(filename, algorithm)
+
+    if hmac.compare_digest(
+        actual_hash.lower(), expected_hash.strip().lower()
+    ):
+        return "PASS: File integrity verified."
+    else:
+        return "FAIL: File may be modified or corrupted."
+
+
+# Main program
+def main():
+    while True:
+        print("\n===== HASH CALCULATOR =====")
+        print("1. Hash Text")
+        print("2. Hash File")
+        print("3. Check File Integrity")
+        print("4. Exit")
+
+        choice = input("Enter your choice: ")
+
+        if choice == "4":
+            print("Program closed.")
+            break
+
+        if choice not in ("1", "2", "3"):
+            print("Invalid choice. Try again.")
+            continue
+
+        print("\n1. MD5")
+        print("2. SHAKE-128")
+        print("3. SHA-256")
+
+        selected = input("Choose algorithm: ")
+        algorithms = {
+            "1": "md5",
+            "2": "shake_128",
+            "3": "sha256"
+        }
+
+        if selected not in algorithms:
+            print("Invalid algorithm.")
+            continue
+
+        algorithm = algorithms[selected]
+
+        try:
+            if choice == "1":
+                text = input("Enter text: ")
+                result = calculate_hash(
+                    text.encode("utf-8"), algorithm
+                )
+                print("Hash:", result)
+
+            elif choice == "2":
+                filename = input("Enter file path: ")
+                result = file_hash(filename, algorithm)
+                print("File Hash:", result)
+
+            elif choice == "3":
+                filename = input("Enter file path: ")
+                expected = input("Enter original hash: ")
+                result = check_integrity(
+                    filename, expected, algorithm
+                )
+                print(result)
+
+        except FileNotFoundError:
+            print("Error: File not found.")
+        except PermissionError:
+            print("Error: Permission denied.")
+        except OSError as error:
+            print("File error:", error)
+        except ValueError as error:
+            print("Error:", error)
+
+
+if __name__ == "__main__":
+    main()
